@@ -1,0 +1,322 @@
+---
+title: "Clustering Companies by CDS Spread Curves Using Gaussian Mixture Models"
+subtitle: "Can we identify clusters of companies that have similar risk trends?"
+author: 
+  - Ruizi Liu
+date: today
+date-format: long
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    keep-tex: true
+prefer-html: true
+editor: visual
+bibliography: references.bib
+thanks: "Code and data are available at: [https://github.com/RIRI0527/437_final_project.git](https://github.com/RIRI0527/437_final_project.git)."
+execute:
+  echo: false
+  output: true
+  warning: false
+---
+```{r load-and-clean-data, message=FALSE, warning=FALSE}
+# Loading Required Packages
+library(here)
+library(dplyr)
+library(mclust)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(psych)
+library(tidyr)
+library(gridExtra)
+library(corrplot)
+
+# Load the RData
+load(here("data/CDS_data.RData"))  # assumes your file is stored in /data
+
+# Check NAs
+# anyNA(data)
+
+# Aggregate to 1 row per company
+cds_avg <- data %>%
+  group_by(Company) %>%
+  summarise(across(starts_with("PX"), mean, na.rm = TRUE)) %>%
+  ungroup()
+
+# Log-transform and scale PX1 to PX10
+cds_transformed <- cds_avg %>%
+  mutate(across(starts_with("PX"), ~ log1p(.))) %>%
+  mutate(across(starts_with("PX"), scale))
+```
+
+\newpage
+# Introduction
+A credit default swap (CDS) is a financial swap contract. The seller of a CDS gives the buyer indemnification in the case of a default or other credit event by the debtor. The buyer of a CDS makes a sequence of payments (the CDS "premium" or "spread") to the seller, and in return, the buyer will receive a payout if the asset defaults [@wikiCDS]. CDS are widely used as a default risk hedge for the borrower and an arbitrage tool for investors, and are a very important financial product in the financial markets. Barings Bank collapsed in 1995 when Nick Leeson gambled on selling straddles for derivative securities on the Tokyo and Singapore stock exchanges and lost $1.4 billion. Therefore, it is necessary to study which companies have the same risk patterns according to statistical data, which can then steer investors away from risk [@wikiCDS]. The data set contains the CDS spreads over ten tenors (PX1 to PX10) for 600 hundreds of firms over time (PXi is i-year tenor spread). With this richness of structure, it is well-suited for multivariate analysis, in particular for uncovering latent credit risk patterns.
+
+The research question in this paper is: Can we identify clusters of companies that have similar risk trends? More precisely, can firms be classified into various classes according to the evaluation of the financial market?. To solve this question, we will use Gaussian Mixture Model (GMM), which is one of the most powerful model-based clustering techniques. 
+
+# Data and Preprocessing
+## Overview
+The data used is from the UofT STA437 [@STA437], used the`R`programming language [@citeR], the `here` package [@here] to load the data; `dplyr` package [@dplyr], `mclust` package [@mclust], `knitr` package [@knitr] and `ggplot2` package [@ggplot2], `psych` package [@psych], `tidyr` package [@tidyr], `gridExtra` package [@gridExtra], and `corrplot` package [@corrplot] to clean the data, fit the GMM, and plot the  graphs, tables and clusters. 
+
+The CDS spreads dataset contains over 1 million rows, with daily CDS spreads (PX1 to PX10) for over 600 companies. Each row includes the company name, ticker symbol, date, and CDS spreads for 10 maturities. The CDS spreads (`PX1` to `PX10`) range from near-zero to over 40,000. @tbl-data-summary represents the data summary for `PX1` to `PX10`, showed that `PX1`–`PX10` are highly skewed with some values exceeding 40,000. @fig-box-data shows that each maturity has a wide range and strong right skew, we use of log transformation to justify it and handle extreme outliers. @fig-cor-data shows the different tenors are positively correlated, but they are not perfectly aligned, this makes multivariate modeling appropriate. 
+
+```{r tbl-data-summary, warning=FALSE, message=FALSE}
+#| tbl-cap: Summary Statistics of CDS Spread Columns (PX1–PX10)
+
+# Create summary table
+px_summary <- describe(data %>% select(starts_with("PX")))
+
+# Show as nicely formatted table
+kable(px_summary, digits = 2)
+```
+
+```{r fig-box-data}
+#| fig-cap: Distribution of CDS Spreads by Maturity
+
+# Reshape the data to long formats
+data_long <- data %>%
+  pivot_longer(cols = starts_with("PX"), names_to = "Tenor", values_to = "Spread")
+
+# Boxplot of spreads by tenor
+ggplot(data_long, aes(x = Tenor, y = Spread)) +
+  geom_boxplot(outlier.alpha = 0.2, fill = "lightblue") +
+  scale_y_log10() + 
+  labs(y = "CDS Spread (log scale)",
+       x = "Tenor (PX1–PX10)") +
+  theme_minimal()
+```
+
+```{r fig-cor-data, warning=FALSE, message=FALSE}
+#| fig-cap: Correlation Between CDS Spread Tenors
+
+px_corr <- cor(data %>% select(starts_with("PX")), use = "pairwise.complete.obs")
+
+corrplot(px_corr, method = "color", type = "upper", tl.col = "black", tl.cex = 0.8, mar = c(0, 0, 1, 0))
+```
+
+## Data Cleaning & Transformation
+We first use `anyNA()` to check if there is NAs in the data, we got the return `FALSE` so there is no NAs. Next, we compute the average CDS spreads over time per company to create a single CDS spreads curve per firm, and apply the `log1p()` fuction to transform the data, this is to reduce skew. Then standardized each `PXi` column using `scale()` function to ensure comparability across dimensions.
+
+# Methodology
+We select GMM for application in cluster analysis. In comparison with other cluster analysis methods, for example, k-mean clustering or hierarchical clustering, clusters in GMM can assume more flexible directions, shapes, and covariance structures. GMM is thus better adapted to capture the term structure of credit default swaps (CDS). Moreover, GMM offers soft probability assignments and automatic model selection through Bayesian Information Criterion (BIC), and it is thus a more robust and explanatory option.
+
+We applied Gaussian Mixture Models (GMMs) to the transformed, averaged CDS spread data, which follows the standardized noral distribution. We assume each company's CDS spread curve (a 10-dimensional vector of PX1–PX10) comes from one of K unknown groups, each modeled by a multivariate normal distribution. This followed by the mixture model: 
+$$
+p(x_i) = \sum_{k=1}^{K} \pi_k \cdot \mathcal{N}(x_i \mid \mu_k, \Sigma_k)
+$$
+where
+
+- $\pi_k$ is the mixing proportion for cluster $k$, with $\sum_k \pi_k = 1$, 
+
+- $\mathcal{N}(x_i \mid \mu_k, \Sigma_k)$ is the multivariate Gaussian pdf for cluster $k$, 
+
+- $\mu_k$ and $\Sigma_k$ are the mean and covariance matrix of cluster $k$. 
+
+Since our goal is to find cluster for each company, so we do not know the cluster for each company, thus, it is latent. We can apply the EM Algorithm (Expectation-Maximization) to estimate the parameters and assign clusters. We use `Mclust()` function to choose the $K$ automatically by BIC, in @sec-add-fig-tbl, @fig-BIC will show a bar plot where the best $K$ is the one with the highest BIC score. For each $K$, it fits a GMM and compute it BIC, the `Mclust()` function will select the model with the highest BIC value, which has the best balance of fit and simplicity. Then we randomly initialize the means $\mu_k$, covariance $\Sigma_k$, and mixing proportion $\pi_k$. This is also automaticlly done by the `Mclust()` function. 
+
+Next we move to the E-Step (Expectation). We need to compute the posterior probability that observation $x_i$ belongs to cluster $k$:
+$$
+\gamma_k^{(t)}(x_i) = P(Z_i = k \mid x_i) = 
+\frac{ \pi_k^{(t)} \cdot \mathcal{N}(x_i \mid \mu_k^{(t)}, \Sigma_k^{(t)}) }
+     { \sum_{j=1}^{K} \pi_j^{(t)} \cdot \mathcal{N}(x_i \mid \mu_j^{(t)}, \Sigma_j^{(t)}) }
+$$
+This gives a posterior probability (or responsibilities) that each point $x_i$ belongs to cluster $k$. These responsibilities are then used to form the expected complete-data log-likelihood:
+$$
+Q(\theta; \theta^{(t)}) = \sum_{i=1}^{n} \sum_{k=1}^{K} \gamma_k(x_i) \left[ \log \mathcal{N}(x_i \mid \mu_k, \Sigma_k) + \log \pi_k \right]
+$$
+
+In the M-Step (Maximazation), we will updating the parameters in our model by maximizing the log-likelihood $Q(\theta; \theta^{(t)})$, which is obtained in the E-Step already. The parameters need to be updated are mixing proportions $\pi_k$, the cluster mean $\mu_k$, and the covariance matrix $\Sigma_k$. We using the current responsibilities $\gamma_k(x_i)$ as werights: 
+
+- Updating mixing proportions $\pi_k$: 
+$$
+\pi_k^{(t+1)} = \frac{1}{n} \sum_{i=1}^{n} \gamma_k^{(t)}(x_i)
+$$
+- Updating cluster mean $\mu_k$: 
+$$
+\mu_k^{(t+1)} = \frac{\sum_{i=1}^{n} \gamma_k^{(t)}(x_i) \cdot x_i}{\sum_{i=1}^{n} \gamma_k^{(t)}(x_i)}
+$$
+- Updating covariance matrix $\Sigma_k$: 
+$$
+\Sigma_k^{(t+1)} = \frac{\sum_{i=1}^{n} \gamma_k^{(t)}(x_i) (x_i - \mu_k^{(t+1)})(x_i - \mu_k^{(t+1)})^\top}{\sum_{i=1}^{n} \gamma_k^{(t)}(x_i)}
+$$
+
+These updated parameters will be used in the next E-Step, the EM algorithm iterates between the E-step and M-step until convergence, at which point the log-likelihood no longer increases significantly (i.e., the log-likelihood stabilize) [@STA437Notes]. 
+
+Once the converged in the EM Algorithm, we can assign each $x_i$ in data to the cluster with highest posterior probability
+$$
+\hat{z}_i = \arg\max_k \, \gamma_k(x_i),
+$$
+which give us the final clusters.
+
+# Results {#sec-result}
+```{r fit-model, output=FALSE}
+# Fit Gaussian Mixture Model (GMM)
+gmm_model <- Mclust(select(cds_transformed, starts_with("PX")))
+
+# Add cluster labels to the data
+cds_transformed$Cluster <- as.factor(gmm_model$classification)
+cds_avg$Cluster <- cds_transformed$Cluster  # attach to company names
+``` 
+
+## Model Visualization 
+@sec-result represents the key findings. We apply the `Mclust()` function to fit our GMM automatically, @tbl-model-sum reports the estimated means (PX1–PX10) and blending percentages for the clusters detected by the GMM. Cluster 3, which contains 17.4% of companies, has the highest mean CDS spreads over tenors, pointing to high credit risk. Cluster 1 and Cluster 5 have negative average values, which correspond to better credit profiles. Cluster 4, the most frequent group (27.5%), has close-to-zero spread values, which suggest base creditworthiness. These cluster profiles confirm that GMM successfully captured important variation in firm risk profiles from multivariate CDS term structure data.
+
+@tbl-cluster-summary represents the number of companies allocated to each risk cluster by the Gaussian Mixture Model. Cluster 4 has the highest number of companies (197), and Cluster 2 is the smallest cluster (18 companies), which would suggest that it could be a rare or transitional risk profile.
+```{r tbl-model-sum}
+#| tbl-cap: GMM Coefficient Summary Table
+# 1. Cluster means (mu_k) — PX1 to PX10 per cluster
+cluster_means <- as.data.frame(t(gmm_model$parameters$mean))
+cluster_means$Cluster <- rownames(cluster_means)
+
+# 2. Mixing proportions
+cluster_means$Proportion <- round(gmm_model$parameters$pro, 3)
+
+# 3. Reorder columns
+cluster_means <- cluster_means %>%
+  relocate(Cluster, Proportion)
+
+# 4. Format as nice table
+kable(cluster_means, caption = "GMM Cluster Means and Mixing Proportions",
+      digits = 3, format = "html") %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+```{r tbl-cluster-summary}
+#| tbl-cap: Number of Companies per GMM Cluster
+# Create a summary table as a data frame
+cluster_summary <- as.data.frame(table(cds_avg$Cluster))
+
+# Rename columns for clarity
+colnames(cluster_summary) <- c("Cluster", "Number_of_Companies")
+
+# Display as kable
+kable(cluster_summary, caption = "Number of Companies per Cluster")
+```
+In @fig-cluster, we plotted the clustering outcomes on PX1 (short-run spread) and PX10 (long-run spread) as axes. To aid interpretability, we superimposed ellipses for the variance and correlation structure of the modeled Gaussian components of the GMM. The figure emphasizes both the different risk profiles of the clusters and also the soft probabilistic boundaries between the clusters. For example, clusters with high PX1 and PX10 (e.g., Cluster 3) are those of companies with consistently high credit risk, while others (e.g., Cluster 1) group companies with relatively low spreads and flat term structures. In @sec-add-fig-tbl, @tbl-top-5-companies represents the list of top 5 companies from each cluster. 
+```{r fig-cluster}
+#| fig-cap: Clusters of CDS Spread Curves
+#| 
+# Visualize PX1 vs PX10 colored by cluster
+ggplot(cds_transformed, aes(x = PX1, y = PX10, color = Cluster)) +
+  stat_ellipse(geom = "polygon", alpha = 0.1, aes(fill = Cluster), show.legend = FALSE) +
+  geom_point(alpha = 0.7) +
+  labs(
+    x = "Short-Term Spread (PX1)",
+    y = "Long-Term Spread (PX10)"
+  ) +
+  theme_minimal()
+```
+## Result Analysis
+```{r fig-trend}
+#| fig-cap: CDS Term Structure by Cluster
+
+# Reshape data for plotting
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+
+# Attach cluster labels to original PX values
+cds_plot_data <- cds_transformed %>%
+  select(starts_with("PX")) %>%
+  mutate(Cluster = cds_transformed$Cluster,
+         Company = cds_avg$Company) %>%
+  pivot_longer(cols = starts_with("PX"), names_to = "Tenor", values_to = "Spread")
+
+# Plot average PX curve per cluster
+cds_plot_data %>%
+  group_by(Cluster, Tenor) %>%
+  summarise(AvgSpread = mean(Spread), .groups = "drop") %>%
+  ggplot(aes(x = Tenor, y = AvgSpread, color = Cluster, group = Cluster)) +
+  geom_line(size = 1.2) +
+  labs(x = "Tenor (PX1–PX10)",
+       y = "Average Transformed Spread") +
+  theme_minimal()
+```
+In @fig-trend, the term structure of credit default swap (CDS) spreads (from PX1 to PX10) varies considerably across clusters. Cluster 3 consistently experiences the highest spreads across all maturities, suggesting that these companies carry persistently higher credit risks. Cluster 1 and Cluster 2 exhibit lower spreads and relatively flat curves, indicating a more stable credit profile. These characteristics represent compelling evidence that GMM identifies economically relevant risk groupings.
+```{r fig-boxplot}
+#| fig-cap: Boxplot of Average CDS Spread by Cluster
+# Compute overall average CDS spread per company (across PX1–PX10)
+cds_avg$MeanSpread <- cds_avg %>%
+  select(starts_with("PX")) %>%
+  rowMeans()
+
+# Boxplot: distribution of risk levels per cluster
+ggplot(cds_avg, aes(x = Cluster, y = MeanSpread, fill = Cluster)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(y = "Average Spread (PX1–PX10)",
+       x = "Cluster") +
+  theme_minimal()
+```
+In @fig-boxplot, the box plots of the CDS spread averages show that the clusters differ by the level of credit risk. Cluster 3 contains the most risky firms, followed by cluster 6, which is riskier. Clusters 1, 2 and 5 present a lower and narrower spread distribution, i.e., they consist of less risky firms. These findings are in line with the spread curve analysis and confirm the reasonableness of the cluster analysis.
+```{r fig-year-plot,warning=FALSE, message=FALSE}
+#| fig-cap: Short-Term Risk (PX1) by Cluster Over Time
+
+# 1. Combine original CDS `data` with cluster labels
+data_with_cluster <- data %>%
+  group_by(Company) %>%
+  mutate(Cluster = cds_transformed$Cluster[match(Company, cds_avg$Company)]) %>%
+  ungroup()
+
+# 2. Convert Date to Date type
+data_with_cluster$Date <- as.Date(data_with_cluster$Date)
+
+# 3. Aggregate: get average PX1 (short-term risk) by Date and Cluster
+cds_time_series <- data_with_cluster %>%
+  group_by(Date, Cluster) %>%
+  summarise(AvgPX1 = mean(PX1, na.rm = TRUE)) %>%
+  ungroup()
+
+# 4. Plot time series
+ggplot(cds_time_series, aes(x = Date, y = AvgPX1, color = Cluster)) +
+  geom_line(alpha = 0.8, size = 1) +
+  labs(title = "Short-Term Risk (PX1) by Cluster Over Time",
+       x = "Date",
+       y = "Average PX1 (Short-Term CDS Spread)") +
+  theme_minimal()
+```
+In @fig-year-plot, we add the `Date` variable in the data by `as.Date()` function. We analyse the variation of short-term credit default swap (CDS) spreads (PX1) over time in different clusters. During the New Crown outbreak in early 2020, the risk perception of cluster 3 rises sharply, with PX1 reaching a peak of over 1000. other clusters such as cluster 6 also react, but to a lesser extent. This suggests that cluster 3 contains firms that are systemically vulnerable to global financial shocks. similar spikes in spreads in early 2016 and late 2018 further suggest that these risk groups reflect not only structured levels of spreads, but also sensitivity to real market events.
+
+# Conclusion
+In this project, we use a Gaussian Mixture Model (GMM) to conduct a cluster analysis of credit default swaps (CDS). By log-transforming and averaging each firm's spread data, we prepare our data for multivariate modelling by reducing the dimensionality of the data (from 1,061,106 to 600). GMM is a highly flexible and powerful clustering analysis technique, which has the ability to model the shape and magnitude of the term structure very effectively, and Bayesian Information Criterion (BIC) can automatically determine the number of clusters, and choosing the most optimum number of clusters that are optimal to cluster.
+
+Clusters are derived from GMM, a method of cluster analysis, reveal the distinction in the credit risk of companies. There are clusters with companies with low and flat credit default swap (CDS) curves, where the market is very confident, and there are clusters with companies with high and steep CDS curves, indicating the market continues to see risk in these companies. Through further analysis, we found that actual events do affect CDS curves, e.g., the covid-19 in the early 2020. 
+
+Overall, this analysis reflect that we can identify clusters of companies that have similar risk trends. The GMM-based approach is well-aligned with the theory taught in STA437, offering both statistical rigor and interpretability for real-world financial data.
+
+\newpage
+# Appendix {#sec-appendix}
+## Additional Figures and Tables {#sec-add-fig-tbl}
+```{r tbl-top-5-companies, warning=FALSE}
+#| tbl-cap: Top 5 Companies from Each Cluster
+
+# View top 5 companies from each cluster as a kable table
+cds_avg %>%
+  group_by(Cluster) %>%
+  slice_head(n = 5) %>%
+  select(Company, Cluster, PX1, PX10) %>%
+  kable()
+```
+
+```{r fig-BIC}
+#| fig-cap: Visualize the BIC Values For Each K
+
+# Visualize the BIC values for each k
+plot(gmm_model, what = "BIC")
+```
+
+```{r appendix-save, message=FALSE, warning=FALSE, echo=FALSE, results='hide'}
+# Save the code file silently without showing output
+# dummy <- knitr::purl("437_final_project.qmd", output = "appendix_code.R")
+```
+
+## R Code Used in Analysis
+```{r, echo=FALSE, results='asis'}
+knitr::asis_output(
+  paste(c("```", gsub("#", "\\\\#", readLines("appendix_code.R")), "```"), collapse = "\n")
+)
+```
+
+\newpage
+# References
